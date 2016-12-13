@@ -1,0 +1,15 @@
+apply plugin: 'java'
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+    jcenter()
+}
+
+dependencies {
+    compile "io.javaslang:javaslang:2.0.5"
+
+    runtime fileTree(dir: 'libs', include: '*.jar')
+
+    testCompile 'junit:junit:4.12'
+}
