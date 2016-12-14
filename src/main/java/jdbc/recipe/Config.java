@@ -1,5 +1,8 @@
 package jdbc.recipe;
 
+import javaslang.control.Option;
+import javaslang.control.Try;
+
 public class Config {
     private final String srcUrl;
     private final String srcUser;
@@ -10,6 +13,7 @@ public class Config {
     private final String tableFilter;
     private final int batchSize;
     private final int maxCount;
+    private final String transactionFile;
 
     public Config(
             String srcUrl, String
@@ -20,7 +24,7 @@ public class Config {
             String targetPassword,
             String tableFilter,
             int batchSize,
-            int maxCount) {
+            int maxCount, String transactionFile) {
         this.srcUrl = srcUrl;
         this.srcUser = srcUser;
         this.srcPassword = srcPassword;
@@ -30,6 +34,32 @@ public class Config {
         this.tableFilter = tableFilter;
         this.batchSize = batchSize;
         this.maxCount = maxCount;
+        this.transactionFile = transactionFile;
+    }
+
+    static String env(String source_url) {
+        return System.getenv(source_url);
+    }
+
+    static int intEnv(String key, int defaultValue) {
+        return Try.of(() -> Integer.valueOf(env(key))).getOrElse(defaultValue);
+    }
+
+    static Config fromEnv() {
+        String sUrl = env("source.url");
+        String sUser = env("source.user");
+        String sPassword = env("source.password");
+        String tUrl = env("target.url");
+        String tUser = env("target.user");
+        String tPassword = env("target.password");
+        String tableFilter = env("table.filter");
+        int batchSize = intEnv("table.data.batch.size", 1000);
+        int maxCount = intEnv("table.data.batch.max", -1);
+        String transactionFile = Option.of(env("transaction.file")).getOrElse("/tmp/copy_db_trans.log");
+        return new Config(
+                sUrl, sUser, sPassword,
+                tUrl, tUser, tPassword,
+                tableFilter, batchSize, maxCount, transactionFile);
     }
 
     public String getSrcUrl() {
@@ -66,5 +96,9 @@ public class Config {
 
     public int getMaxCount() {
         return maxCount;
+    }
+
+    public String getTransactionFile() {
+        return transactionFile;
     }
 }

@@ -1,50 +1,40 @@
 package jdbc.recipe;
 
-import javaslang.*;
+import javaslang.Function1;
+import javaslang.Tuple;
+import javaslang.Tuple2;
 import javaslang.collection.*;
 import javaslang.concurrent.Future;
-import javaslang.control.Try;
+import javaslang.control.Option;
 import jdbc.recipe.model.Column;
 import jdbc.recipe.model.IndexColumn;
 import jdbc.recipe.model.PrimaryKeyColumn;
 import jdbc.recipe.model.Table;
 
+import java.io.IOException;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.*;
 import java.text.MessageFormat;
+import java.util.stream.Collectors;
+
+import static java.nio.file.StandardOpenOption.*;
 
 public class CopyDB {
 
-    public static final long NUM_OF_PARALLEL = 4L;
+    private static final long NUM_OF_PARALLEL = 4L;
 
-    public static void main(String[] args) throws SQLException {
-        Config config = fromEnv();
-        doCopy(config);
+    public static void main(String[] args) throws Exception {
+        doCopy(Config.fromEnv());
     }
 
-    private static Config fromEnv() {
-        String sUrl = env("source.url");
-        String sUser = env("source.user");
-        String sPassword = env("source.password");
-        String tUrl = env("target.url");
-        String tUser = env("target.user");
-        String tPassword = env("target.password");
-        String tableFilter = env("table.filter");
-        int batchSize = intEnv("table.data.batch.size", 1000);
-        int maxCount = intEnv("table.data.batch.max", -1);
-        return new Config(sUrl, sUser, sPassword, tUrl, tUser, tPassword, tableFilter, batchSize, maxCount);
-    }
-
-    private static int intEnv(String key, int defaultValue) {
-        return Try.of(() -> Integer.valueOf(env(key))).getOrElse(defaultValue);
-    }
-
-    private static String env(String source_url) {
-        return System.getenv(source_url);
-    }
-
-    private static void doCopy(Config config) throws SQLException {
+    private static void doCopy(Config config) throws SQLException, IOException {
         try (Connection sConn = getConnection(config.getSrcUrl(), config.getSrcUser(), config.getSrcPassword());
-             Connection tConn = getConnection(config.getTargetUrl(), config.getTargetUser(), config.getTargetPassword())) {
+             Connection tConn = getConnection(config.getTargetUrl(), config.getTargetUser(), config.getTargetPassword());
+        ) {
+            Path path = FileSystems.getDefault().getPath(config.getTransactionFile());
+            Map<String, Long> startedTables = recoverFromTranslog(tConn, path, config.getTableFilter());
             DatabaseMetaData metaData = sConn.getMetaData();
             try (ResultSet tableResult = metaData.getTables(null, null, config.getTableFilter(), new String[]{"TABLE"})) {
                 iterateRs(tableResult, Table::fromResultSet)
@@ -58,7 +48,7 @@ public class CopyDB {
                                     getIndexColumns(metaData, tableName)
                                             .filter(c -> c.indexName != null)
                                             .filter(c -> !pkNames.contains(c.indexName));
-                            List<String> tableStructureSql =
+                            List<String> tableStructureSql = startedTables.containsKey(tableName) ? List.empty() :
                                     Stream.of(dropTableSql(tableName), createTableSql(tableName, columns))
                                     .appendAll(createPrimaryKeySqls(tableName, primaryKeys))
                                     .appendAll(createIndexSqls(tableName, indexColumns))
@@ -74,51 +64,89 @@ public class CopyDB {
                                     tableGroup.forEach(t -> {
                                         String tableName = t._1;
                                         List<String> createTableSql = t._2;
-                                        String insertSql = t._3;
                                         executeSqls(tConn, createTableSql);
-                                        copyData(sConn, tConn, tableName, insertSql,
-                                                config.getBatchSize(), config.getMaxCount());
+                                        Option<String> insertSql = t._3;
+                                        if (!insertSql.isEmpty()) {
+                                            copyData(sConn, tConn, tableName, insertSql.get(),
+                                                    config.getBatchSize(), config.getMaxCount(),
+                                                    startedTables.get(tableName), path);
+                                        }
                                     });
                                     return true;
+                                }).onFailure(e -> {
+                                    throw new RuntimeException(e);
                                 }))
                         .toList()
-                        .map(Future::get)
-                        .reduce((l, r) -> l && r);
+                        .map(x -> x.getOrElse(false))
+                        .foldLeft(true, (l, r) -> l && r);
             }
         }
     }
 
+    private static Map<String, Long> recoverFromTranslog(Connection tConn, Path path, String tableFilter) throws IOException {
+        List<Tuple2<String, Long>> translog = getTranslogSnapshot(path);
+        executeSqls(tConn,
+                translog.filter(t -> t._1.matches(tableFilter.replace("%", ".*")))
+                        .map(t1 -> String.format("DELETE FROM %s WHERE id > %s", t1._1, t1._2)));
+        return translog.toMap(t -> t);
+    }
+
+    private static List<Tuple2<String, Long>> getTranslogSnapshot(Path path) throws IOException {
+        if (Files.exists(path)) {
+            return Stream.ofAll(Files.lines(path).collect(Collectors.toList()))
+                    .map(x -> {
+                        String[] kv = x.split("=");
+                        return Tuple.of(kv[0], kv[1]);
+                    })
+                    .groupBy(t -> t._1)
+                    .map(t -> Tuple.of(t._1, t._2.map(x -> Long.valueOf(x._2)).max().get()))
+                    .toList();
+        }
+        return List.empty();
+    }
+
     private static void copyData(
             Connection sourceConnection, Connection targetConnection,
-            String tableName, String insertSql, int batchSize, int maxCount) {
+            String tableName, String insertSql, int batchSize, int maxCount,
+            Option<Long> startOffset, Path translogPath) {
         log(insertSql);
         try (PreparedStatement preparedStatement = targetConnection.prepareStatement(insertSql);
              Statement statement = sourceConnection.createStatement()) {
             batchCopyData(statement, preparedStatement,
-                    tableName, batchSize, maxCount);
+                    tableName, batchSize, maxCount, startOffset, translogPath);
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
     }
 
     private static void batchCopyData(
-            Statement sourceStatement, PreparedStatement targetStatement, String tableName, int batchSize, int maxCount) {
-        int batchIndex = 0;
-        while ((batchSize * batchIndex < maxCount || maxCount == -1) &&
-                doBatchCopyData(sourceStatement, targetStatement, tableName, batchSize, batchIndex)) {
-            batchIndex++;
+            Statement sourceStatement, PreparedStatement targetStatement,
+            String tableName, int batchSize, int maxCount,
+            Option<Long> startOffset, Path translogPath) {
+        int offset = Math.toIntExact(startOffset.getOrElse(0L));
+        while ((offset < maxCount || maxCount == -1) &&
+                doBatchCopyData(sourceStatement, targetStatement, tableName, batchSize, offset, translogPath)) {
+            offset += batchSize;
+        }
+    }
+
+    private static void appendTranslog(Path translogPath, String tableName, int position) {
+        try {
+            Files.write(translogPath, List.of(String.format("%s=%s", tableName, position)), APPEND, WRITE, CREATE);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
         }
     }
 
     private static boolean doBatchCopyData(
             Statement sourceStatement, PreparedStatement targetStatement,
-            String tableName, int batchSize, int batchIndex) {
+            String tableName, int batchSize, int offset, Path translogPath) {
         String sqlTemplate = "" +
                 "SELECT * \n" +
                 "  FROM %s \n" +
                 "ORDER BY id ASC \n" +
                 "OFFSET %s ROWS FETCH NEXT %s ROWS ONLY;\n";
-        String sql = String.format(sqlTemplate, tableName, batchIndex * batchSize, batchSize);
+        String sql = String.format(sqlTemplate, tableName, offset, batchSize);
         log(sql);
         try (ResultSet rs = sourceStatement.executeQuery(sql)) {
             int rowCount = iterateRs(rs, r -> {
@@ -140,21 +168,32 @@ public class CopyDB {
             }).sum().intValue();
             targetStatement.executeBatch();
             targetStatement.clearParameters();
-            log(String.format("processed %s rows of table %s", batchIndex * batchSize, tableName));
+            log(String.format("processed %s rows of table %s", offset + rowCount, tableName));
+            appendTranslog(translogPath, tableName, offset);
             return rowCount == batchSize;
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
     }
 
-    private static String createInsertSql(String tableName, List<Column> columns) {
-        return MessageFormat.format("" +
-                        "SET IDENTITY_INSERT {0} ON;\n" +
-                        "INSERT INTO {0}({1}) VALUES({2});\n" +
-                        "SET IDENTITY_INSERT {0} OFF;",
+    private static Option<String> createInsertSql(String tableName, List<Column> columns) {
+        Option<Column> idColumn = columns.find(c -> c.columnName.equalsIgnoreCase("id"));
+        if (idColumn.isEmpty()) {
+            return Option.none();
+        }
+        String insertSql = MessageFormat.format("INSERT INTO {0}({1}) VALUES({2})",
                 tableName,
                 columns.map(c -> c.columnName).mkString(","),
                 Stream.range(0, columns.length()).map(i -> "?").mkString(","));
+        if (idColumn.get().isAutoIncrement == Column.ThreeState.YES) {
+            return Option.some(MessageFormat.format("" +
+                            "SET IDENTITY_INSERT {0} ON;\n" + "{1};\n" +
+                            "SET IDENTITY_INSERT {0} OFF;\n",
+                    tableName,
+                    insertSql));
+        } else {
+            return Option.some(insertSql);
+        }
     }
 
     private static String dropTableSql(String tableName) {
