@@ -23,7 +23,9 @@ import static java.nio.file.StandardOpenOption.*;
 public class CopyDB {
 
     private static final long NUM_OF_PARALLEL = 4L;
-    private static Set<String> unusedTables = Stream.of("dataHandlerLog", "jobBizErrorLog").toSet();
+    private static Set<String> unusedTables = Stream.of(
+            "dataHandlerLog", "jobBizErrorLog", "emailAlerted",
+            "emailAlert").toSet();
 
     public static void main(String[] args) throws Exception {
         Config config = Config.fromEnv();
@@ -33,7 +35,6 @@ public class CopyDB {
             Path path = FileSystems.getDefault().getPath(config.getTransactionFile());
             Map<String, Long> startedTables = recoverFromTranslog(tConn, path, config.getTableFilter());
 
-            Function1<String, Option<Long>> lastCopyProgress = startedTables::get;
             DatabaseMetaData metaData = sConn.getMetaData();
             Try.of(() -> getTableList(metaData, config.getTableFilter()))
                     .andThenTry(tables -> copyTables(config, sConn, tConn, path, startedTables, metaData, tables));
@@ -76,12 +77,13 @@ public class CopyDB {
                 indexColumnList
                         .filter(c -> c.indexName != null)
                         .filter(c -> !pkNames.contains(c.indexName));
-        Option<List<String>> tableStructureSql = lastOffset.map(offset ->
-                Stream.of(dropTableSql(tableName), createTableSql(tableName, columns))
+        List<String> tableStructureSql = lastOffset
+                .map(offset -> List.<String>empty())
+                .getOrElse(() -> Stream.of(dropTableSql(tableName), createTableSql(tableName, columns))
                         .appendAll(createPrimaryKeySqls(tableName, primaryKeys))
                         .appendAll(createIndexSqls(tableName, indexColumns))
                         .toList());
-        return Tuple.of(tableName, tableStructureSql.getOrElse(List.empty()), createInsertSql(tableName, columns), lastOffset);
+        return Tuple.of(tableName, tableStructureSql, createInsertSql(tableName, columns), lastOffset);
     }
 
     private static Try.CheckedSupplier<Boolean> copyGroupOfTables(
@@ -110,6 +112,7 @@ public class CopyDB {
         List<Tuple2<String, Long>> translog = getTranslogSnapshot(path);
         executeSqls(tConn,
                 translog.filter(t -> t._1.matches(tableFilter.replace("%", ".*")))
+                        .filter(t -> !unusedTables.contains(t._1))
                         .map(t1 -> String.format("DELETE FROM %s WHERE id > %s", t1._1, t1._2)));
         return translog.toMap(t -> t);
     }
