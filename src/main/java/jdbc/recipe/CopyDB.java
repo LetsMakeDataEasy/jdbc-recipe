@@ -48,63 +48,68 @@ public class CopyDB {
     }
 
     private static Boolean copyTables(Config config, Connection sConn, Connection tConn, Path path, Map<String, Long> startedTables, DatabaseMetaData metaData, List<Table> tables) {
-        return tables.filter(t1 -> !unusedTables.contains(t1.TABLE_NAME))
+        return tables
+                .filter(t1 -> !unusedTables.contains(t1.TABLE_NAME))
                 .map(table -> {
                     String tableName = table.TABLE_NAME;
-                    List<Column> columns = getColumns(metaData, tableName);
-                    List<PrimaryKeyColumn> primaryKeys = getPrimaryKeys(metaData, tableName);
-                    List<IndexColumn> indexColumnList = getIndexColumns(metaData, tableName);
-                    Option<Long> lastOffset = startedTables.get(tableName);
-                    return makeSql(tableName, columns, primaryKeys, indexColumnList, lastOffset);
-                }).toList()
+                    Tuple3<List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>> tableInfo = loadTableInfo(metaData, tableName);
+                    return (Function0<Boolean>) () -> copyOneTable(config, sConn, tConn, path, startedTables, tableName, tableInfo);
+                })
                 .zipWithIndex()
                 .groupBy(t -> t._2 % NUM_OF_PARALLEL)
                 .map(t -> t._2)
                 .map(l -> l.map(t -> t._1))
-                .map(tableGroup ->
-                        Future.of(copyGroupOfTables(config, sConn, tConn, path, tableGroup))
-                                .onFailure(e -> {
-                                    throw new RuntimeException(e);
-                                }))
+                .map(taskGroup ->
+                        Future.of(() -> {
+                            taskGroup.forEach(Function0::apply);
+                            return true;
+                        }).onFailure(e -> {
+                            throw new RuntimeException(e);
+                        }))
                 .toList()
                 .map(x -> x.getOrElse(false))
                 .foldLeft(true, (l, r) -> l && r);
     }
 
-    private static Tuple4<String, List<String>, Option<String>, Option<Long>> makeSql(String tableName, List<Column> columns, List<PrimaryKeyColumn> primaryKeys, List<IndexColumn> indexColumnList, Option<Long> lastOffset) {
-        Set<String> pkNames = primaryKeys.map(c -> c.pkName).toSet();
-        List<IndexColumn> indexColumns =
-                indexColumnList
-                        .filter(c -> c.indexName != null)
-                        .filter(c -> !pkNames.contains(c.indexName));
-        List<String> tableStructureSql = lastOffset
-                .map(offset -> List.<String>empty())
-                .getOrElse(() -> Stream.of(dropTableSql(tableName), createTableSql(tableName, columns))
-                        .appendAll(createPrimaryKeySqls(tableName, primaryKeys))
-                        .appendAll(createIndexSqls(tableName, indexColumns))
-                        .toList());
-        return Tuple.of(tableName, tableStructureSql, createInsertSql(tableName, columns), lastOffset);
+    private static Boolean copyOneTable(Config config, Connection sConn, Connection tConn, Path path, Map<String, Long> startedTables, String tableName, Tuple3<List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>> tableInfo) {
+        Option<Long> lastOffset = startedTables.get(tableName);
+        boolean isNotCreated = lastOffset.isEmpty();
+        if (isNotCreated) {
+            createTable(tConn, tableName, tableInfo);
+        }
+        Option<String> insertSql = createInsertSql(tableName, tableInfo._1);
+        if (!insertSql.isEmpty()) {
+            copyData(sConn, tConn, tableName, insertSql.get(),
+                    config.getBatchSize(), lastOffset, path);
+        }
+        return true;
     }
 
-    private static Try.CheckedSupplier<Boolean> copyGroupOfTables(
-            Config config,
-            Connection sConn,
-            Connection tConn,
-            Path path,
-            List<Tuple4<String, List<String>, Option<String>, Option<Long>>> tableGroup) {
-        return () -> {
-            tableGroup.forEach(t -> {
-                String tableName = t._1;
-                List<String> createTableSql = t._2;
-                executeSqls(tConn, createTableSql);
-                Option<String> insertSql = t._3;
-                if (!insertSql.isEmpty()) {
-                    copyData(sConn, tConn, tableName, insertSql.get(),
-                            config.getBatchSize(), t._4, path);
-                }
-            });
-            return true;
-        };
+    private static void createTable(Connection tConn, String tableName, Tuple3<List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>> tableInfo) {
+        List<String> tableStructureSql = makeCreateTableSql(tableName, tableInfo._1, tableInfo._2, tableInfo._3);
+        executeSqls(tConn, tableStructureSql);
+    }
+
+    private static Tuple3<List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>> loadTableInfo(DatabaseMetaData metaData, String tableName) {
+        List<Column> columns = loadColumns(metaData, tableName);
+        List<PrimaryKeyColumn> primaryKeys = loadPrimaryKeys(metaData, tableName);
+        List<IndexColumn> indexColumnList = loadIndexColumns(metaData, tableName);
+        return Tuple.of(columns, primaryKeys, indexColumnList);
+    }
+
+    private static List<String> makeCreateTableSql(
+            String tableName,
+            List<Column> columns,
+            List<PrimaryKeyColumn> primaryKeys,
+            List<IndexColumn> indexColumnList) {
+        Set<String> pkNames = primaryKeys.map(c -> c.pkName).toSet();
+        List<IndexColumn> indexColumns = indexColumnList
+                .filter(c -> c.indexName != null)
+                .filter(c -> !pkNames.contains(c.indexName));
+        return Stream.of(dropTableSql(tableName), createTableSql(tableName, columns))
+                .appendAll(createPrimaryKeySqls(tableName, primaryKeys))
+                .appendAll(createIndexSqls(tableName, indexColumns))
+                .toList();
     }
 
     private static Map<String, Long> recoverFromTranslog(Connection tConn, Path path, String tableFilter) throws IOException {
@@ -304,7 +309,7 @@ public class CopyDB {
         }
     }
 
-    private static List<PrimaryKeyColumn> getPrimaryKeys(DatabaseMetaData metaData, String tableName) {
+    private static List<PrimaryKeyColumn> loadPrimaryKeys(DatabaseMetaData metaData, String tableName) {
         try (ResultSet rs = metaData.getPrimaryKeys(null, null, tableName)) {
             return streamRS(rs).map(PrimaryKeyColumn::fromResultSet).toList();
         } catch (SQLException e) {
@@ -312,7 +317,7 @@ public class CopyDB {
         }
     }
 
-    private static List<IndexColumn> getIndexColumns(DatabaseMetaData metaData, String tableName) {
+    private static List<IndexColumn> loadIndexColumns(DatabaseMetaData metaData, String tableName) {
         try (ResultSet rs = metaData.getIndexInfo(null, null, tableName, false, false)) {
             return streamRS(rs).map(IndexColumn::fromResultSet).toList();
         } catch (SQLException e) {
@@ -320,7 +325,7 @@ public class CopyDB {
         }
     }
 
-    private static List<Column> getColumns(DatabaseMetaData metaData, String tableName) {
+    private static List<Column> loadColumns(DatabaseMetaData metaData, String tableName) {
         try (ResultSet rs = metaData.getColumns(null, null, tableName, "%")) {
             return streamRS(rs).map(Column::fromResultSet).toList();
         } catch (SQLException e) {
