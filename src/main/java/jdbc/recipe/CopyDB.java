@@ -1,11 +1,10 @@
 package jdbc.recipe;
 
-import javaslang.Function1;
-import javaslang.Tuple;
-import javaslang.Tuple2;
+import javaslang.*;
 import javaslang.collection.*;
 import javaslang.concurrent.Future;
 import javaslang.control.Option;
+import javaslang.control.Try;
 import jdbc.recipe.model.Column;
 import jdbc.recipe.model.IndexColumn;
 import jdbc.recipe.model.PrimaryKeyColumn;
@@ -24,63 +23,86 @@ import static java.nio.file.StandardOpenOption.*;
 public class CopyDB {
 
     private static final long NUM_OF_PARALLEL = 4L;
+    private static Set<String> unusedTables = Stream.of("dataHandlerLog", "jobBizErrorLog").toSet();
 
     public static void main(String[] args) throws Exception {
-        doCopy(Config.fromEnv());
-    }
-
-    private static void doCopy(Config config) throws SQLException, IOException {
+        Config config = Config.fromEnv();
         try (Connection sConn = getConnection(config.getSrcUrl(), config.getSrcUser(), config.getSrcPassword());
              Connection tConn = getConnection(config.getTargetUrl(), config.getTargetUser(), config.getTargetPassword());
         ) {
             Path path = FileSystems.getDefault().getPath(config.getTransactionFile());
             Map<String, Long> startedTables = recoverFromTranslog(tConn, path, config.getTableFilter());
+
+            Function1<String, Option<Long>> lastCopyProgress = startedTables::get;
             DatabaseMetaData metaData = sConn.getMetaData();
-            try (ResultSet tableResult = metaData.getTables(null, null, config.getTableFilter(), new String[]{"TABLE"})) {
-                iterateRs(tableResult, Table::fromResultSet)
-                        .filter(t -> !unusedTables.contains(t.TABLE_NAME))
-                        .map(table -> {
-                            String tableName = table.TABLE_NAME;
-                            List<Column> columns = getColumns(metaData, tableName);
-                            List<PrimaryKeyColumn> primaryKeys = getPrimaryKeys(metaData, tableName);
-                            Set<String> pkNames = primaryKeys.map(c -> c.pkName).toSet();
-                            List<IndexColumn> indexColumns =
-                                    getIndexColumns(metaData, tableName)
-                                            .filter(c -> c.indexName != null)
-                                            .filter(c -> !pkNames.contains(c.indexName));
-                            List<String> tableStructureSql = startedTables.containsKey(tableName) ? List.empty() :
-                                    Stream.of(dropTableSql(tableName), createTableSql(tableName, columns))
-                                    .appendAll(createPrimaryKeySqls(tableName, primaryKeys))
-                                    .appendAll(createIndexSqls(tableName, indexColumns))
-                                    .toList();
-                            return Tuple.of(tableName, tableStructureSql, createInsertSql(tableName, columns));
-                        }).toList()
-                        .zipWithIndex()
-                        .groupBy(t -> t._2 % NUM_OF_PARALLEL)
-                        .map(t -> t._2)
-                        .map(l -> l.map(t -> t._1))
-                        .map(tableGroup -> Future.of(
-                                () -> {
-                                    tableGroup.forEach(t -> {
-                                        String tableName = t._1;
-                                        List<String> createTableSql = t._2;
-                                        executeSqls(tConn, createTableSql);
-                                        Option<String> insertSql = t._3;
-                                        if (!insertSql.isEmpty()) {
-                                            copyData(sConn, tConn, tableName, insertSql.get(),
-                                                    config.getBatchSize(), config.getMaxCount(),
-                                                    startedTables.get(tableName), path);
-                                        }
-                                    });
-                                    return true;
-                                }).onFailure(e -> {
+            Try.of(() -> getTableList(metaData, config.getTableFilter()))
+                    .andThenTry(tables -> copyTables(config, sConn, tConn, path, startedTables, metaData, tables));
+        }
+    }
+
+    private static List<Table> getTableList(DatabaseMetaData metaData, String tableFilter) throws SQLException {
+        try (ResultSet tableResult = metaData.getTables(null, null, tableFilter, new String[]{"TABLE"})) {
+            return iterateRs(tableResult, Table::fromResultSet);
+        }
+    }
+
+    private static Boolean copyTables(Config config, Connection sConn, Connection tConn, Path path, Map<String, Long> startedTables, DatabaseMetaData metaData, List<Table> tables) {
+        return tables.filter(t1 -> !unusedTables.contains(t1.TABLE_NAME))
+                .map(table -> {
+                    String tableName = table.TABLE_NAME;
+                    List<Column> columns = getColumns(metaData, tableName);
+                    List<PrimaryKeyColumn> primaryKeys = getPrimaryKeys(metaData, tableName);
+                    List<IndexColumn> indexColumnList = getIndexColumns(metaData, tableName);
+                    Option<Long> lastOffset = startedTables.get(tableName);
+                    return makeSql(tableName, columns, primaryKeys, indexColumnList, lastOffset);
+                }).toList()
+                .zipWithIndex()
+                .groupBy(t -> t._2 % NUM_OF_PARALLEL)
+                .map(t -> t._2)
+                .map(l -> l.map(t -> t._1))
+                .map(tableGroup ->
+                        Future.of(copyGroupOfTables(config, sConn, tConn, path, tableGroup))
+                                .onFailure(e -> {
                                     throw new RuntimeException(e);
                                 }))
-                        .toList()
-                        .map(x -> x.getOrElse(false))
-                        .foldLeft(true, (l, r) -> l && r);
-            }
-        }
+                .toList()
+                .map(x -> x.getOrElse(false))
+                .foldLeft(true, (l, r) -> l && r);
+    }
+
+    private static Tuple4<String, List<String>, Option<String>, Option<Long>> makeSql(String tableName, List<Column> columns, List<PrimaryKeyColumn> primaryKeys, List<IndexColumn> indexColumnList, Option<Long> lastOffset) {
+        Set<String> pkNames = primaryKeys.map(c -> c.pkName).toSet();
+        List<IndexColumn> indexColumns =
+                indexColumnList
+                        .filter(c -> c.indexName != null)
+                        .filter(c -> !pkNames.contains(c.indexName));
+        Option<List<String>> tableStructureSql = lastOffset.map(offset ->
+                Stream.of(dropTableSql(tableName), createTableSql(tableName, columns))
+                        .appendAll(createPrimaryKeySqls(tableName, primaryKeys))
+                        .appendAll(createIndexSqls(tableName, indexColumns))
+                        .toList());
+        return Tuple.of(tableName, tableStructureSql.getOrElse(List.empty()), createInsertSql(tableName, columns), lastOffset);
+    }
+
+    private static Try.CheckedSupplier<Boolean> copyGroupOfTables(
+            Config config,
+            Connection sConn,
+            Connection tConn,
+            Path path,
+            List<Tuple4<String, List<String>, Option<String>, Option<Long>>> tableGroup) {
+        return () -> {
+            tableGroup.forEach(t -> {
+                String tableName = t._1;
+                List<String> createTableSql = t._2;
+                executeSqls(tConn, createTableSql);
+                Option<String> insertSql = t._3;
+                if (!insertSql.isEmpty()) {
+                    copyData(sConn, tConn, tableName, insertSql.get(),
+                            config.getBatchSize(), config.getMaxCount(), t._4, path);
+                }
+            });
+            return true;
+        };
     }
 
     private static Map<String, Long> recoverFromTranslog(Connection tConn, Path path, String tableFilter) throws IOException {
@@ -201,8 +223,6 @@ public class CopyDB {
                 "IF OBJECT_ID('dbo.%s', 'U') IS NOT NULL \n" +
                 "DROP TABLE dbo.%s; ", tableName, tableName);
     }
-
-    private static Set<String> unusedTables = Stream.of("dataHandlerLog", "jobBizErrorLog").toSet();
 
     private static Seq<String> createPrimaryKeySqls(String tableName, List<PrimaryKeyColumn> primaryKeys) {
         String sqlTemplate = "ALTER TABLE %s ADD CONSTRAINT %s PRIMARY KEY CLUSTERED (%s)";
