@@ -12,7 +12,6 @@ public class Config {
     private final String targetPassword;
     private final String tableFilter;
     private final int batchSize;
-    private final int maxCount;
     private final String transactionFile;
 
     public Config(
@@ -24,7 +23,7 @@ public class Config {
             String targetPassword,
             String tableFilter,
             int batchSize,
-            int maxCount, String transactionFile) {
+            String transactionFile) {
         this.srcUrl = srcUrl;
         this.srcUser = srcUser;
         this.srcPassword = srcPassword;
@@ -33,7 +32,6 @@ public class Config {
         this.targetPassword = targetPassword;
         this.tableFilter = tableFilter;
         this.batchSize = batchSize;
-        this.maxCount = maxCount;
         this.transactionFile = transactionFile;
     }
 
@@ -54,12 +52,11 @@ public class Config {
         String tPassword = env("target.password");
         String tableFilter = env("table.filter");
         int batchSize = intEnv("table.data.batch.size", 1000);
-        int maxCount = intEnv("table.data.batch.max", -1);
         String transactionFile = Option.of(env("transaction.file")).getOrElse("/tmp/copy_db_trans.log");
         return new Config(
                 sUrl, sUser, sPassword,
                 tUrl, tUser, tPassword,
-                tableFilter, batchSize, maxCount, transactionFile);
+                tableFilter, batchSize, transactionFile);
     }
 
     public String getSrcUrl() {
@@ -92,10 +89,6 @@ public class Config {
 
     public int getBatchSize() {
         return batchSize;
-    }
-
-    public int getMaxCount() {
-        return maxCount;
     }
 
     public String getTransactionFile() {

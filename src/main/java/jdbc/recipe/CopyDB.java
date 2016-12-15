@@ -98,7 +98,7 @@ public class CopyDB {
                 Option<String> insertSql = t._3;
                 if (!insertSql.isEmpty()) {
                     copyData(sConn, tConn, tableName, insertSql.get(),
-                            config.getBatchSize(), config.getMaxCount(), t._4, path);
+                            config.getBatchSize(), t._4, path);
                 }
             });
             return true;
@@ -106,6 +106,7 @@ public class CopyDB {
     }
 
     private static Map<String, Long> recoverFromTranslog(Connection tConn, Path path, String tableFilter) throws IOException {
+        log("Using translog from " + path.toString());
         List<Tuple2<String, Long>> translog = getTranslogSnapshot(path);
         executeSqls(tConn,
                 translog.filter(t -> t._1.matches(tableFilter.replace("%", ".*")))
@@ -129,13 +130,16 @@ public class CopyDB {
 
     private static void copyData(
             Connection sourceConnection, Connection targetConnection,
-            String tableName, String insertSql, int batchSize, int maxCount,
+            String tableName, String insertSql, int batchSize,
             Option<Long> startOffset, Path translogPath) {
         log(insertSql);
         try (PreparedStatement preparedStatement = targetConnection.prepareStatement(insertSql);
              Statement statement = sourceConnection.createStatement()) {
+            ResultSet resultSet = statement.executeQuery("SELECT max(id) FROM " + tableName);
+            resultSet.next();
+            long maxId = resultSet.getLong(1);
             batchCopyData(statement, preparedStatement,
-                    tableName, batchSize, maxCount, startOffset, translogPath);
+                    tableName, batchSize, maxId, startOffset, translogPath);
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
@@ -143,11 +147,11 @@ public class CopyDB {
 
     private static void batchCopyData(
             Statement sourceStatement, PreparedStatement targetStatement,
-            String tableName, int batchSize, int maxCount,
+            String tableName, int batchSize, long maxId,
             Option<Long> startOffset, Path translogPath) {
         int offset = Math.toIntExact(startOffset.getOrElse(0L));
-        while ((offset < maxCount || maxCount == -1) &&
-                doBatchCopyData(sourceStatement, targetStatement, tableName, batchSize, offset, translogPath)) {
+        while ((offset < maxId)) {
+            doBatchCopyData(sourceStatement, targetStatement, tableName, batchSize, offset, translogPath);
             offset += batchSize;
         }
     }
@@ -166,9 +170,8 @@ public class CopyDB {
         String sqlTemplate = "" +
                 "SELECT * \n" +
                 "  FROM %s \n" +
-                "ORDER BY id ASC \n" +
-                "OFFSET %s ROWS FETCH NEXT %s ROWS ONLY;\n";
-        String sql = String.format(sqlTemplate, tableName, offset, batchSize);
+                " WHERE id >= %s and id < %s;\n";
+        String sql = String.format(sqlTemplate, tableName, offset, offset + batchSize);
         log(sql);
         try (ResultSet rs = sourceStatement.executeQuery(sql)) {
             int rowCount = iterateRs(rs, r -> {
@@ -192,7 +195,7 @@ public class CopyDB {
             targetStatement.clearParameters();
             log(String.format("processed %s rows of table %s", offset + rowCount, tableName));
             appendTranslog(translogPath, tableName, offset);
-            return rowCount == batchSize;
+            return true;
         } catch (SQLException e) {
             throw new RuntimeException(e);
         }
