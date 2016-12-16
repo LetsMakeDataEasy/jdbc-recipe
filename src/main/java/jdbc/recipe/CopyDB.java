@@ -94,7 +94,7 @@ public class CopyDB {
         Option<Long> lastOffset = startedTables.get(tableName);
         boolean isNotCreated = lastOffset.isEmpty();
         if (isNotCreated) {
-            createTable(tConn, tableInfo);
+            executeSqls(tConn, makeCreateTableSql(tableInfo));
         }
         Option<String> insertSql = createInsertSql(tableName, tableInfo._2);
         if (!insertSql.isEmpty()) {
@@ -104,24 +104,19 @@ public class CopyDB {
         return true;
     }
 
-    private static void createTable(Connection tConn, Tuple4<String, List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>> tableInfo) {
-        List<String> tableStructureSql = makeCreateTableSql(tableInfo._1, tableInfo._2, tableInfo._3, tableInfo._4);
-        executeSqls(tConn, tableStructureSql);
-    }
-
     private static List<String> makeCreateTableSql(
-            String tableName,
-            List<Column> columns,
-            List<PrimaryKeyColumn> primaryKeys,
-            List<IndexColumn> indexColumnList) {
-        Set<String> pkNames = primaryKeys.map(c -> c.pkName).toSet();
-        List<IndexColumn> indexColumns = indexColumnList
-                .filter(c -> c.indexName != null)
-                .filter(c -> !pkNames.contains(c.indexName));
-        return Stream.of(dropTableSql(tableName), createTableSql(tableName, columns))
-                .appendAll(createPrimaryKeySqls(tableName, primaryKeys))
-                .appendAll(createIndexSqls(tableName, indexColumns))
-                .toList();
+            Tuple4<String, List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>> tableInfo) {
+        return tableInfo.transform((tableName, columns, primaryKeys, indexColumnList) -> {
+            Set<String> pkNames = primaryKeys.map(c -> c.pkName).toSet();
+
+            List<IndexColumn> indexColumns = indexColumnList
+                    .filter(c -> c.indexName != null)
+                    .filter(c -> !pkNames.contains(c.indexName));
+            return Stream.of(dropTableSql(tableName), createTableSql(tableName, columns))
+                    .appendAll(createPrimaryKeySqls(tableName, primaryKeys))
+                    .appendAll(createIndexSqls(tableName, indexColumns))
+                    .toList();
+        });
     }
 
     private static Map<String, Long> recoverFromTranslog(Connection tConn, Path path, String tableFilter) throws IOException {
