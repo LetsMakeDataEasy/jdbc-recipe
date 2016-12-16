@@ -36,29 +36,43 @@ public class CopyDB {
             Map<String, Long> startedTables = recoverFromTranslog(tConn, path, config.getTableFilter());
 
             DatabaseMetaData metaData = sConn.getMetaData();
-            Try.of(() -> getTableList(metaData, config.getTableFilter()))
-                    .andThenTry(tables -> copyTables(config, sConn, tConn, path, startedTables, metaData, tables));
+            Try.of(() -> loadTables(metaData, config.getTableFilter()))
+                    .map(tablesInfo -> makeCopyTasks(config, sConn, tConn, path, startedTables, tablesInfo))
+                    .map(CopyDB::groupByIndex)
+                    .andThen(CopyDB::parallelizeByGroup)
+                    .onFailure(RuntimeException::new);
         }
     }
 
-    private static List<Table> getTableList(DatabaseMetaData metaData, String tableFilter) throws SQLException {
+    private static List<Tuple4<String, List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>>> loadTables(DatabaseMetaData metaData, String tableFilter) throws SQLException {
         try (ResultSet tableResult = metaData.getTables(null, null, tableFilter, new String[]{"TABLE"})) {
-            return iterateRs(tableResult, Table::fromResultSet);
+            return iterateRs(tableResult, Table::fromResultSet)
+                    .filter(t1 -> !unusedTables.contains(t1.TABLE_NAME))
+                    .map(table -> Try.of(() -> {
+                        String tableName = table.TABLE_NAME;
+                        List<Column> columns = loadColumns(metaData, tableName);
+                        List<PrimaryKeyColumn> primaryKeys = loadPrimaryKeys(metaData, tableName);
+                        List<IndexColumn> indexColumnList = loadIndexColumns(metaData, tableName);
+                        return Tuple.of(tableName, columns, primaryKeys, indexColumnList);
+                    }).get());
         }
     }
 
-    private static Boolean copyTables(Config config, Connection sConn, Connection tConn, Path path, Map<String, Long> startedTables, DatabaseMetaData metaData, List<Table> tables) {
-        return tables
-                .filter(t1 -> !unusedTables.contains(t1.TABLE_NAME))
-                .map(table -> {
-                    String tableName = table.TABLE_NAME;
-                    Tuple3<List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>> tableInfo = loadTableInfo(metaData, tableName);
-                    return (Function0<Boolean>) () -> copyOneTable(config, sConn, tConn, path, startedTables, tableName, tableInfo);
-                })
+    private static List<Function0<Boolean>> makeCopyTasks(Config config, Connection sConn, Connection tConn, Path path, Map<String, Long> startedTables, List<Tuple4<String, List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>>> tablesInfo) {
+        return tablesInfo.map(tableInfo ->
+                () -> copyOneTable(config, sConn, tConn, path, startedTables, tableInfo));
+    }
+
+    private static Seq<List<Function0<Boolean>>> groupByIndex(List<Function0<Boolean>> tasks) {
+        return tasks
                 .zipWithIndex()
                 .groupBy(t -> t._2 % NUM_OF_PARALLEL)
                 .map(t -> t._2)
-                .map(l -> l.map(t -> t._1))
+                .map(l -> l.map(t -> t._1));
+    }
+
+    private static Boolean parallelizeByGroup(Seq<List<Function0<Boolean>>> taskGroups) {
+        return taskGroups
                 .map(taskGroup ->
                         Future.of(() -> {
                             taskGroup.forEach(Function0::apply);
@@ -71,13 +85,18 @@ public class CopyDB {
                 .foldLeft(true, (l, r) -> l && r);
     }
 
-    private static Boolean copyOneTable(Config config, Connection sConn, Connection tConn, Path path, Map<String, Long> startedTables, String tableName, Tuple3<List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>> tableInfo) {
+    private static Boolean copyOneTable(
+            Config config, Connection sConn,
+            Connection tConn, Path path,
+            Map<String, Long> startedTables,
+            Tuple4<String, List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>> tableInfo) {
+        String tableName = tableInfo._1;
         Option<Long> lastOffset = startedTables.get(tableName);
         boolean isNotCreated = lastOffset.isEmpty();
         if (isNotCreated) {
-            createTable(tConn, tableName, tableInfo);
+            createTable(tConn, tableInfo);
         }
-        Option<String> insertSql = createInsertSql(tableName, tableInfo._1);
+        Option<String> insertSql = createInsertSql(tableName, tableInfo._2);
         if (!insertSql.isEmpty()) {
             copyData(sConn, tConn, tableName, insertSql.get(),
                     config.getBatchSize(), lastOffset, path);
@@ -85,16 +104,9 @@ public class CopyDB {
         return true;
     }
 
-    private static void createTable(Connection tConn, String tableName, Tuple3<List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>> tableInfo) {
-        List<String> tableStructureSql = makeCreateTableSql(tableName, tableInfo._1, tableInfo._2, tableInfo._3);
+    private static void createTable(Connection tConn, Tuple4<String, List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>> tableInfo) {
+        List<String> tableStructureSql = makeCreateTableSql(tableInfo._1, tableInfo._2, tableInfo._3, tableInfo._4);
         executeSqls(tConn, tableStructureSql);
-    }
-
-    private static Tuple3<List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>> loadTableInfo(DatabaseMetaData metaData, String tableName) {
-        List<Column> columns = loadColumns(metaData, tableName);
-        List<PrimaryKeyColumn> primaryKeys = loadPrimaryKeys(metaData, tableName);
-        List<IndexColumn> indexColumnList = loadIndexColumns(metaData, tableName);
-        return Tuple.of(columns, primaryKeys, indexColumnList);
     }
 
     private static List<String> makeCreateTableSql(
@@ -317,19 +329,15 @@ public class CopyDB {
         }
     }
 
-    private static List<IndexColumn> loadIndexColumns(DatabaseMetaData metaData, String tableName) {
+    private static List<IndexColumn> loadIndexColumns(DatabaseMetaData metaData, String tableName) throws SQLException {
         try (ResultSet rs = metaData.getIndexInfo(null, null, tableName, false, false)) {
             return streamRS(rs).map(IndexColumn::fromResultSet).toList();
-        } catch (SQLException e) {
-            throw new RuntimeException(e);
         }
     }
 
-    private static List<Column> loadColumns(DatabaseMetaData metaData, String tableName) {
+    private static List<Column> loadColumns(DatabaseMetaData metaData, String tableName) throws SQLException {
         try (ResultSet rs = metaData.getColumns(null, null, tableName, "%")) {
             return streamRS(rs).map(Column::fromResultSet).toList();
-        } catch (SQLException e) {
-            throw new RuntimeException(e);
         }
     }
 
