@@ -14,7 +14,7 @@ public class Column {
             column.columnName = rs.getString("COLUMN_NAME");
             column.dataType = JDBCType.valueOf(rs.getInt("DATA_TYPE"));
             column.typeName = rs.getString("TYPE_NAME");
-            column.columnSize = rs.getInt("COLUMN_SIZE");
+            column.columnSize = Math.max(rs.getInt("COLUMN_SIZE"), rs.getInt("BUFFER_LENGTH"));
             column.decimalDigits = rs.getInt("DECIMAL_DIGITS");
             column.radix = rs.getInt("NUM_PREC_RADIX");
             column.nullable = getThreeState(rs.getString("IS_NULLABLE"));

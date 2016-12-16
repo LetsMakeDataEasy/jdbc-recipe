@@ -132,6 +132,7 @@ public class CopyDB {
     private static List<Tuple2<String, Long>> getTranslogSnapshot(Path path) throws IOException {
         if (Files.exists(path)) {
             return Stream.ofAll(Files.lines(path).collect(Collectors.toList()))
+                    .filter(x -> x.length() > 3)
                     .map(x -> {
                         String[] kv = x.split("=");
                         return Tuple.of(kv[0], kv[1]);
@@ -195,7 +196,7 @@ public class CopyDB {
                             .rangeClosed(1, r.getMetaData().getColumnCount())
                             .forEach(i -> {
                                 try {
-                                    targetStatement.setObject(i, r.getObject(i));
+                                    targetStatement.setObject(i, JDBCUtils.getResultSetValue(rs, i));
                                 } catch (SQLException e) {
                                     throw new RuntimeException(e);
                                 }
@@ -224,7 +225,13 @@ public class CopyDB {
         String insertSql = MessageFormat.format("INSERT INTO {0}({1}) VALUES({2})",
                 tableName,
                 columns.map(c -> c.columnName).mkString(","),
-                Stream.range(0, columns.length()).map(i -> "?").mkString(","));
+                columns.map(c -> {
+                    if (c.dataType == JDBCType.VARBINARY || c.dataType == JDBCType.BLOB) {
+                        return "CAST(? AS VARBINARY(MAX))";
+                    } else {
+                        return "?";
+                    }
+                }).mkString(","));
         if (idColumn.get().isAutoIncrement == Column.ThreeState.YES) {
             return Option.some(MessageFormat.format("" +
                             "SET IDENTITY_INSERT {0} ON;\n" + "{1};\n" +
