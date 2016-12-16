@@ -164,7 +164,7 @@ public class CopyDB {
             Statement sourceStatement, PreparedStatement targetStatement,
             String tableName, int batchSize, long maxId,
             Option<Long> startOffset, Path translogPath) {
-        int offset = Math.toIntExact(startOffset.getOrElse(0L));
+        int offset = Math.toIntExact(startOffset.map(x -> x + 1).getOrElse(0L));
         while ((offset < maxId)) {
             doBatchCopyData(sourceStatement, targetStatement, tableName, batchSize, offset, translogPath);
             offset += batchSize;
