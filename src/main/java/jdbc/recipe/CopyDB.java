@@ -46,13 +46,13 @@ public class CopyDB {
 
     private static List<Tuple4<String, List<Column>, List<PrimaryKeyColumn>, List<IndexColumn>>> loadTables(DatabaseMetaData metaData, String tableFilter) throws SQLException {
         try (ResultSet tableResult = metaData.getTables(null, null, tableFilter, new String[]{"TABLE"})) {
-            return iterateRs(tableResult, Table::fromResultSet)
+            return JDBCUtils.iterateRs(tableResult, Table::fromResultSet)
                     .filter(t1 -> !unusedTables.contains(t1.TABLE_NAME))
                     .map(table -> Try.of(() -> {
                         String tableName = table.TABLE_NAME;
-                        List<Column> columns = loadColumns(metaData, tableName);
-                        List<PrimaryKeyColumn> primaryKeys = loadPrimaryKeys(metaData, tableName);
-                        List<IndexColumn> indexColumnList = loadIndexColumns(metaData, tableName);
+                        List<Column> columns = JDBCUtils.loadColumns(metaData, tableName);
+                        List<PrimaryKeyColumn> primaryKeys = JDBCUtils.loadPrimaryKeys(metaData, tableName);
+                        List<IndexColumn> indexColumnList = JDBCUtils.loadIndexColumns(metaData, tableName);
                         return Tuple.of(tableName, columns, primaryKeys, indexColumnList);
                     }).get());
         }
@@ -190,7 +190,7 @@ public class CopyDB {
         String sql = String.format(sqlTemplate, tableName, offset, offset + batchSize);
         log(sql);
         try (ResultSet rs = sourceStatement.executeQuery(sql)) {
-            int rowCount = iterateRs(rs, r -> {
+            int rowCount = JDBCUtils.iterateRs(rs, r -> {
                 try {
                     Stream
                             .rangeClosed(1, r.getMetaData().getColumnCount())
@@ -323,26 +323,6 @@ public class CopyDB {
         }
     }
 
-    private static List<PrimaryKeyColumn> loadPrimaryKeys(DatabaseMetaData metaData, String tableName) {
-        try (ResultSet rs = metaData.getPrimaryKeys(null, null, tableName)) {
-            return streamRS(rs).map(PrimaryKeyColumn::fromResultSet).toList();
-        } catch (SQLException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    private static List<IndexColumn> loadIndexColumns(DatabaseMetaData metaData, String tableName) throws SQLException {
-        try (ResultSet rs = metaData.getIndexInfo(null, null, tableName, false, false)) {
-            return streamRS(rs).map(IndexColumn::fromResultSet).toList();
-        }
-    }
-
-    private static List<Column> loadColumns(DatabaseMetaData metaData, String tableName) throws SQLException {
-        try (ResultSet rs = metaData.getColumns(null, null, tableName, "%")) {
-            return streamRS(rs).map(Column::fromResultSet).toList();
-        }
-    }
-
     private static void log(String str) {
         System.out.println(str);
     }
@@ -351,50 +331,4 @@ public class CopyDB {
         return DriverManager.getConnection(url, user, password);
     }
 
-    private static <T> List<T> iterateRs(ResultSet rs, Function1<ResultSet, T> rowMapper) {
-        return streamRS(rs).map(rowMapper).toList();
-    }
-
-    public static Stream<ResultSet> streamRS(ResultSet rs) {
-        return Stream.ofAll(iterableRS(rs));
-    }
-
-    public static Iterable<ResultSet> iterableRS(ResultSet rs) {
-        return new Iterable<ResultSet>() {
-            ResultSet nextRow = null;
-
-            @Override
-            public Iterator<ResultSet> iterator() {
-                return new AbstractIterator<ResultSet>() {
-
-                    @Override
-                    protected ResultSet getNext() {
-                        if (nextRow != null || hasNext()) {
-                            ResultSet row = nextRow;
-                            nextRow = null;
-                            return row;
-                        }
-                        return null;
-                    }
-
-                    @Override
-                    public boolean hasNext() {
-                        if (nextRow != null) {
-                            return true;
-                        } else {
-                            try {
-                                if (rs.next()) {
-                                    nextRow = rs;
-                                    return true;
-                                }
-                                return false;
-                            } catch (SQLException e) {
-                                throw new RuntimeException(e);
-                            }
-                        }
-                    }
-                };
-            }
-        };
-    }
 }
